@@ -1,13 +1,6 @@
 // server.js
-// Demo Express + WebSocket server with JWT auth for WS, demo trade endpoint, and signal broadcasting.
-//
-// Run:
-//   export JWT_SECRET="change_this"
-//   npm install
-//   node server.js
-//
-// Notes:
-// - This is a demo only. Do NOT use the default secret in production.
+// Demo Express + WebSocket server with JWT auth for WS, demo trade endpoint, signal broadcasting,
+// SQLite persistence (better-sqlite3) and a backend market-data aggregator using CoinGecko.
 
 const express = require('express');
 const http = require('http');
@@ -16,6 +9,8 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const jwt = require('jsonwebtoken');
 const path = require('path');
+const fetch = require('node-fetch');
+const Database = require('better-sqlite3');
 const { URL } = require('url');
 
 const app = express();
@@ -31,10 +26,41 @@ const wss = new WebSocket.Server({ server });
 const JWT_SECRET = process.env.JWT_SECRET || 'change_this_secret_in_prod';
 const PORT = process.env.PORT || 4000;
 
-// In-memory stores (demo)
-let trades = [];
+// ---------- SQLite DB (persistent) ----------
+const db = new Database(path.join(__dirname, 'data.db'));
+// Create tables
+db.prepare(
+  `CREATE TABLE IF NOT EXISTS users (
+    username TEXT PRIMARY KEY,
+    created_at TEXT
+  )`
+).run();
 
-// Helper: broadcast object to all authenticated clients
+db.prepare(
+  `CREATE TABLE IF NOT EXISTS trades (
+    id TEXT PRIMARY KEY,
+    user TEXT,
+    type TEXT,
+    asset TEXT,
+    amount REAL,
+    price REAL,
+    timestamp TEXT
+  )`
+).run();
+
+db.prepare(
+  `CREATE TABLE IF NOT EXISTS signals (
+    id TEXT PRIMARY KEY,
+    type TEXT,
+    asset TEXT,
+    price REAL,
+    conf REAL,
+    note TEXT,
+    timestamp TEXT
+  )`
+).run();
+
+// ---------- Helpers ----------
 function broadcast(obj) {
   const msg = JSON.stringify(obj);
   for (const client of wss.clients) {
@@ -44,7 +70,52 @@ function broadcast(obj) {
   }
 }
 
-// Create random demo signal
+function insertSignalToDB(sig) {
+  const stmt = db.prepare(`INSERT OR REPLACE INTO signals (id,type,asset,price,conf,note,timestamp) VALUES (?,?,?,?,?,?,?)`);
+  stmt.run(sig.id, sig.type, sig.asset, sig.price || null, sig.conf || null, sig.note || null, sig.timestamp);
+}
+
+function insertTradeToDB(trade) {
+  const stmt = db.prepare(`INSERT INTO trades (id,user,type,asset,amount,price,timestamp) VALUES (?,?,?,?,?,?,?)`);
+  stmt.run(trade.id, trade.user, trade.type, trade.asset, trade.amount, trade.price || null, trade.timestamp);
+}
+
+// ---------- Market data aggregator (CoinGecko) ----------
+let priceCache = {
+  bitcoin: { usd: null, php: null, last_updated: null },
+  ethereum: { usd: null, php: null, last_updated: null },
+  updatedAt: null
+};
+
+async function fetchMarketData() {
+  try {
+    const url = 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd,php&include_24hr_change=false';
+    const res = await fetch(url, { timeout: 10000 });
+    if (!res.ok) throw new Error('CoinGecko error ' + res.status);
+    const data = await res.json();
+    if (data.bitcoin) {
+      priceCache.bitcoin.usd = data.bitcoin.usd;
+      priceCache.bitcoin.php = data.bitcoin.php;
+    }
+    if (data.ethereum) {
+      priceCache.ethereum.usd = data.ethereum.usd;
+      priceCache.ethereum.php = data.ethereum.php;
+    }
+    priceCache.updatedAt = new Date().toISOString();
+  } catch (e) {
+    console.warn('Market data fetch failed:', e.message || e);
+  }
+}
+// warm initial
+fetchMarketData();
+setInterval(fetchMarketData, 10000);
+
+// Expose /prices endpoint
+app.get('/prices', (req, res) => {
+  res.json(priceCache);
+});
+
+// ---------- Signal generation and persistence ----------
 const SIGNAL_ASSETS = ['BTC', 'ETH', 'PHP', 'GOLD', 'MARKET'];
 const SIGNAL_TYPES = ['BUY', 'SELL', 'HOLD', 'SCAN'];
 function randRange(min, max) { return Math.random() * (max - min) + min; }
@@ -59,34 +130,35 @@ function makeRandomSignal() {
     asset,
     price,
     conf,
-    note: type === 'SELL' ? `Quick profit taken +₱${(randRange(1,20)).toFixed(2)}` : undefined,
+    note: type === 'SELL' ? `Quick profit taken +₱${(randRange(1,20)).toFixed(2)}` : null,
     timestamp: new Date().toISOString()
   };
 }
 
-// Auto broadcast demo signals (every 15-25s)
 let intervalId = null;
 function startAutoBroadcast() {
   if (intervalId) return;
   intervalId = setInterval(() => {
     const sig = makeRandomSignal();
-    console.log('Broadcasting signal', sig.id, sig.type, sig.asset);
+    insertSignalToDB(sig);
     broadcast({ event: 'signal', payload: sig });
+    console.log('Broadcasted signal', sig.id);
   }, Math.floor(randRange(15000, 25000)));
 }
 startAutoBroadcast();
 
-// Simple login: accepts any username/password for demo and issues a JWT
+// ---------- Auth / users ----------
 app.post('/login', (req, res) => {
   const { username } = req.body || {};
   if (!username) return res.status(400).json({ error: 'username required' });
-  // Demo: no password check. In prod, validate credentials.
   const payload = { username };
+  // insert user if not exists
+  const ustmt = db.prepare(`INSERT OR IGNORE INTO users (username, created_at) VALUES (?,?)`);
+  ustmt.run(username, new Date().toISOString());
   const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '6h' });
   res.json({ token, user: payload });
 });
 
-// Protected trade execution: requires Authorization Bearer token
 function verifyAuth(req, res, next) {
   const auth = req.headers.authorization || '';
   const m = auth.match(/^Bearer (.+)$/);
@@ -101,7 +173,7 @@ function verifyAuth(req, res, next) {
   }
 }
 
-// POST /trade to simulate executing a trade
+// POST /trade -> persist trade and broadcast
 app.post('/trade', verifyAuth, (req, res) => {
   const { type, asset, amount, price } = req.body || {};
   if (!type || !asset || !amount) return res.status(400).json({ error: 'type, asset, amount required' });
@@ -114,20 +186,18 @@ app.post('/trade', verifyAuth, (req, res) => {
     price: price || null,
     timestamp: new Date().toISOString()
   };
-  trades.push(trade);
-  // Optionally also broadcast trade execution to clients
+  insertTradeToDB(trade);
   broadcast({ event: 'trade_executed', payload: trade });
   res.json({ status: 'ok', trade });
 });
 
-// GET /trades to list demo trades (protected)
+// GET /trades -> list trades
 app.get('/trades', verifyAuth, (req, res) => {
-  // For demo: return all trades
-  res.json({ trades });
+  const rows = db.prepare('SELECT * FROM trades ORDER BY timestamp DESC LIMIT 200').all();
+  res.json({ trades: rows });
 });
 
-// Allow pushing custom signals via POST /signal (unprotected for demo)
-// Body: { type, asset, price, conf, note }
+// POST /signal -> persist and broadcast
 app.post('/signal', (req, res) => {
   const sig = req.body;
   if (!sig || !sig.type || !sig.asset) {
@@ -135,20 +205,18 @@ app.post('/signal', (req, res) => {
   }
   sig.id = sig.id || `sig_${Date.now()}`;
   sig.timestamp = sig.timestamp || new Date().toISOString();
+  insertSignalToDB(sig);
   broadcast({ event: 'signal', payload: sig });
   res.json({ status: 'sent', signal: sig });
 });
 
-// WebSocket connection: validate token from query parameter ?token=...
+// WebSocket with JWT token in query param
 wss.on('connection', (ws, req) => {
-  // parse token from querystring
   let token = null;
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     token = url.searchParams.get('token');
-  } catch (e) {
-    token = null;
-  }
+  } catch (e) { token = null; }
 
   if (!token) {
     ws.send(JSON.stringify({ event: 'error', payload: { msg: 'Missing token. Close.' } }));
@@ -171,15 +239,12 @@ wss.on('connection', (ws, req) => {
   }
 
   ws.on('message', (data) => {
-    // Accept client messages for demo; we echo 'echo' actions
     try {
       const msg = JSON.parse(data);
       if (msg && msg.action === 'echo') {
         ws.send(JSON.stringify({ event: 'echo', payload: msg.data }));
       }
-    } catch (e) {
-      // ignore non-json
-    }
+    } catch (e) {}
   });
 
   ws.on('close', (code, reason) => {
@@ -187,7 +252,7 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// Start the HTTP + WS server
+// Start server
 server.listen(PORT, () => {
   console.log(`Server listening at http://localhost:${PORT}`);
   console.log(`WebSocket endpoint: ws://localhost:${PORT} (send token as ?token=...)`);
