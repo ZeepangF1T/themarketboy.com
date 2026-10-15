@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TheMarketBoy — Demo (WS + JWT + CoinGecko)</title>
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box;font-family:Segoe UI, sans-serif;}
+    body{background:#080c14;color:#e6eef8}
+    header{background:linear-gradient(135deg,#00c853,#3b82f6);padding:1rem;text-align:center}
+    .container{max-width:1100px;margin:1rem auto;padding:1rem}
+    .card{background:#121a29;padding:1rem;border-radius:12px;margin:1rem 0;border:1px solid #1e293b}
+    input,button{padding:.6rem;border-radius:8px;border:none}
+    .signal{font-family:monospace;margin:.4rem 0}
+    .buy{color:#00c853} .sell{color:#ef4444} .hold{color:#f7931a}
+    #loginStatus{font-size:.9rem;margin-left:.5rem}
+    pre{white-space:pre-wrap;color:#cbd5e1}
+    a{color:#22d3ee}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>TheMarketBoy — Demo (WS + JWT + Market Data)</h1>
+    <div style="margin-top:.6rem">
+      <label><input id="autoTradeCheckbox" type="checkbox"> Auto-execute BUY signals</label>
+      <span id="loginStatus"></span>
+    </div>
+  </header>
+
+  <div class="container">
+    <div class="card" id="authCard">
+      <h3>Login</h3>
+      <div>
+        <input id="username" placeholder="username">
+        <input id="password" placeholder="password" type="password">
+        <button id="loginBtn">Login (demo)</button>
+        <button id="logoutBtn" style="display:none">Logout</button>
+      </div>
+      <p style="margin-top:.6rem;font-size:.9rem;color:#9ca3af">Note: demo login accepts any username. Token stored in localStorage.</p>
+    </div>
+
+    <div class="card">
+      <h3>Market Data</h3>
+      <div id="prices">
+        <div>BTC/USD: <span id="price-btc">$--</span></div>
+        <div>ETH/USD: <span id="price-eth">$--</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Signal Feed</h3>
+      <div id="signalFeed" style="max-height:280px;overflow:auto"></div>
+      <div style="margin-top:.6rem">
+        <button id="connectWS">Connect WS</button>
+        <button id="disconnectWS" style="display:none">Disconnect WS</button>
+        <button id="pushSignal">Push test signal (POST /signal)</button>
+        <button id="showTrades">Show trades (GET /trades)</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Trades (server-side simulated)</h3>
+      <pre id="tradesOut"></pre>
+    </div>
+  </div>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    let token = localStorage.getItem('tm_token') || null;
+    const loginStatus = $('loginStatus');
+    const loginBtn = $('loginBtn'), logoutBtn = $('logoutBtn');
+    function setLoggedIn(tkn, username) {
+      token = tkn;
+      if (tkn) {
+        localStorage.setItem('tm_token', tkn);
+        loginStatus.textContent = 'Logged in as ' + (username || '(user)');
+        loginBtn.style.display = 'none';
+        logoutBtn.style.display = 'inline-block';
+      } else {
+        localStorage.removeItem('tm_token');
+        token = null;
+        loginStatus.textContent = 'Not logged in';
+        loginBtn.style.display = 'inline-block';
+        logoutBtn.style.display = 'none';
+      }
+      if (token && ws === null) connectWS();
+    }
+    if (token) setLoggedIn(token);
+    else setLoggedIn(null);
+
+    loginBtn.addEventListener('click', async () => {
+      const username = $('username').value || 'demo';
+      try {
+        const res = await fetch('/login', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ username }) });
+        const j = await res.json();
+        if (j.token) {
+          setLoggedIn(j.token, username);
+          alert('Logged in (demo). Token saved to localStorage.');
+        } else {
+          alert('Login failed: ' + JSON.stringify(j));
+        }
+      } catch (e) {
+        alert('Login error: ' + e);
+      }
+    });
+
+    logoutBtn.addEventListener('click', () => setLoggedIn(null));
+
+    let ws = null;
+    const signalFeed = $('signalFeed');
+    const autoExecute = $('autoTradeCheckbox');
+
+    function addSignalLine(text, cls) {
+      const d = document.createElement('div');
+      d.className = 'signal ' + (cls||'');
+      d.textContent = text;
+      signalFeed.appendChild(d);
+      signalFeed.scrollTop = signalFeed.scrollHeight;
+    }
+
+    function connectWS() {
+      if (ws) return;
+      const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+      const host = location.hostname;
+      const port = location.port || 4000;
+      const tokenParam = token ? '?token=' + encodeURIComponent(token) : '';
+      const url = `${scheme}://${host}:${port}${tokenParam}`;
+      try { ws = new WebSocket(url); } catch (e) { addSignalLine('WS constructor error: ' + e); ws = null; return; }
+      addSignalLine('Connecting to ' + url);
+      ws.onopen = () => {
+        addSignalLine('WS open', 'hold');
+        $('connectWS').style.display = 'none';
+        $('disconnectWS').style.display = 'inline-block';
+      };
+      ws.onmessage = async (ev) => {
+        try {
+          const obj = JSON.parse(ev.data);
+          if (obj.event === 'welcome') { addSignalLine('[INFO] ' + (obj.payload.msg || 'welcome')); return; }
+          if (obj.event === 'signal' && obj.payload) {
+            const p = obj.payload;
+            const line = `[${p.type}] ${p.asset}${p.price?(' @ ' + p.price):''}${p.conf?(' · Conf:' + p.conf + '%'):''}${p.note?(' · ' + p.note):''}`;
+            addSignalLine(line, (p.type||'').toLowerCase());
+            if (autoExecute.checked && p.type === 'BUY') {
+              try {
+                const tradeResp = await fetch('/trade', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'Authorization': token ? 'Bearer ' + token : '' },
+                  body: JSON.stringify({ type: 'BUY', asset: p.asset, amount: 1, price: p.price })
+                });
+                const tr = await tradeResp.json();
+                addSignalLine('Executed trade: ' + (tr.trade ? tr.trade.id : JSON.stringify(tr)), 'buy');
+              } catch(e){ addSignalLine('Trade exec error: ' + e, 'sell'); }
+            }
+            return;
+          }
+          if (obj.event === 'trade_executed') {
+            addSignalLine('[TRADE EXECUTED] ' + (obj.payload && obj.payload.id ? obj.payload.id : JSON.stringify(obj.payload)), 'buy');
+            return;
+          }
+          addSignalLine('WS message: ' + ev.data);
+        } catch (e) { addSignalLine('Invalid WS message: ' + ev.data); }
+      };
+      ws.onclose = (ev) => {
+        addSignalLine('WS closed: ' + ev.code + ' ' + ev.reason);
+        ws = null;
+        $('connectWS').style.display = 'inline-block';
+        $('disconnectWS').style.display = 'none';
+      };
+      ws.onerror = (err) => { addSignalLine('WS error'); console.error(err); };
+    }
+
+    function disconnectWS() { if (!ws) return; ws.close(); ws = null; $('connectWS').style.display = 'inline-block'; $('disconnectWS').style.display = 'none'; }
+    $('connectWS').addEventListener('click', connectWS);
+    $('disconnectWS').addEventListener('click', disconnectWS);
+
+    $('pushSignal').addEventListener('click', async () => {
+      try {
+        const body = { type: 'BUY', asset: 'BTC', price: 68420, conf: 92, note: 'Manual test buy' };
+        const res = await fetch('/signal', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+        const j = await res.json();
+        addSignalLine('Pushed signal: ' + JSON.stringify(j.signal || j));
+      } catch (e) { addSignalLine('Push signal error: ' + e); }
+    });
+
+    $('showTrades').addEventListener('click', async () => {
+      try {
+        const res = await fetch('/trades', { headers: { 'Authorization': token ? 'Bearer ' + token : '' } });
+        const j = await res.json();
+        $('tradesOut').textContent = JSON.stringify(j.trades || j, null, 2);
+      } catch (e) { $('tradesOut').textContent = 'Error fetching trades: ' + e; }
+    });
+
+    async function fetchPrices() {
+      try {
+        const url = 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd';
+        const r = await fetch(url);
+        const d = await r.json();
+        if (d.bitcoin) $('price-btc').textContent = '$' + d.bitcoin.usd.toFixed(2);
+        if (d.ethereum) $('price-eth').textContent = '$' + d.ethereum.usd.toFixed(2);
+      } catch (e) { console.warn('Price fetch failed', e); }
+    }
+    fetchPrices();
+    setInterval(fetchPrices, 10000);
+
+    if (token) {
+      addSignalLine('Found stored token: connecting WS automatically (demo)');
+      connectWS();
+      $('logoutBtn').style.display = 'inline-block';
+      $('loginBtn').style.display = 'none';
+      loginStatus.textContent = 'Logged in (stored token)';
+    } else {
+      loginStatus.textContent = 'Not logged in';
+    }
+  </script>
+</body>
+</html>
