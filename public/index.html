@@ -17,6 +17,27 @@
     pre{white-space:pre-wrap;color:#cbd5e1}
     a{color:#22d3ee}
   </style>
+
+  <!-- Load server-provided config.js (sets window.APP_ORIGIN from APP_ORIGIN env) -->
+  <script src="/config.js"></script>
+  <script>
+    // origin-aware helpers
+    function apiUrl(path) {
+      const origin = (typeof window !== 'undefined' && window.APP_ORIGIN) ? window.APP_ORIGIN : '';
+      const normalizedOrigin = origin.replace(/\/+$/, '');
+      const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+      return normalizedOrigin ? `${normalizedOrigin}${normalizedPath}` : normalizedPath;
+    }
+
+    function wsUrlForToken(token) {
+      // Determine base origin: APP_ORIGIN or current page origin
+      const origin = (window.APP_ORIGIN && window.APP_ORIGIN.length) ? window.APP_ORIGIN : (window.location.protocol + '//' + window.location.host);
+      const normalizedOrigin = origin.replace(/\/+$/, '');
+      const hostOnly = normalizedOrigin.replace(/^https?:\/\//i, '');
+      const scheme = normalizedOrigin.startsWith('https://') ? 'wss://' : 'ws://';
+      return `${scheme}${hostOnly}?token=${encodeURIComponent(token)}`;
+    }
+  </script>
 </head>
 <body>
   <header>
@@ -69,6 +90,7 @@
     let token = localStorage.getItem('tm_token') || null;
     const loginStatus = $('loginStatus');
     const loginBtn = $('loginBtn'), logoutBtn = $('logoutBtn');
+
     function setLoggedIn(tkn, username) {
       token = tkn;
       if (tkn) {
@@ -85,13 +107,18 @@
       }
       if (token && ws === null) connectWS();
     }
+
     if (token) setLoggedIn(token);
     else setLoggedIn(null);
 
     loginBtn.addEventListener('click', async () => {
       const username = $('username').value || 'demo';
       try {
-        const res = await fetch('/login', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ username }) });
+        const res = await fetch(apiUrl('/login'), {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ username })
+        });
         const j = await res.json();
         if (j.token) {
           setLoggedIn(j.token, username);
@@ -120,11 +147,8 @@
 
     function connectWS() {
       if (ws) return;
-      const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-      const host = location.hostname;
-      const port = location.port || 4000;
-      const tokenParam = token ? '?token=' + encodeURIComponent(token) : '';
-      const url = `${scheme}://${host}:${port}${tokenParam}`;
+      if (!token) return addSignalLine('No token: login first');
+      const url = wsUrlForToken(token);
       try { ws = new WebSocket(url); } catch (e) { addSignalLine('WS constructor error: ' + e); ws = null; return; }
       addSignalLine('Connecting to ' + url);
       ws.onopen = () => {
@@ -142,7 +166,7 @@
             addSignalLine(line, (p.type||'').toLowerCase());
             if (autoExecute.checked && p.type === 'BUY') {
               try {
-                const tradeResp = await fetch('/trade', {
+                const tradeResp = await fetch(apiUrl('/trade'), {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json', 'Authorization': token ? 'Bearer ' + token : '' },
                   body: JSON.stringify({ type: 'BUY', asset: p.asset, amount: 1, price: p.price })
@@ -176,7 +200,7 @@
     $('pushSignal').addEventListener('click', async () => {
       try {
         const body = { type: 'BUY', asset: 'BTC', price: 68420, conf: 92, note: 'Manual test buy' };
-        const res = await fetch('/signal', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+        const res = await fetch(apiUrl('/signal'), { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
         const j = await res.json();
         addSignalLine('Pushed signal: ' + JSON.stringify(j.signal || j));
       } catch (e) { addSignalLine('Push signal error: ' + e); }
@@ -184,7 +208,7 @@
 
     $('showTrades').addEventListener('click', async () => {
       try {
-        const res = await fetch('/trades', { headers: { 'Authorization': token ? 'Bearer ' + token : '' } });
+        const res = await fetch(apiUrl('/trades'), { headers: { 'Authorization': token ? 'Bearer ' + token : '' } });
         const j = await res.json();
         $('tradesOut').textContent = JSON.stringify(j.trades || j, null, 2);
       } catch (e) { $('tradesOut').textContent = 'Error fetching trades: ' + e; }
@@ -192,11 +216,11 @@
 
     async function fetchPrices() {
       try {
-        const url = 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd';
+        const url = apiUrl('/prices');
         const r = await fetch(url);
         const d = await r.json();
-        if (d.bitcoin) $('price-btc').textContent = '$' + d.bitcoin.usd.toFixed(2);
-        if (d.ethereum) $('price-eth').textContent = '$' + d.ethereum.usd.toFixed(2);
+        if (d.bitcoin) $('price-btc').textContent = '$' + (d.bitcoin.usd || 0).toFixed(2);
+        if (d.ethereum) $('price-eth').textContent = '$' + (d.ethereum.usd || 0).toFixed(2);
       } catch (e) { console.warn('Price fetch failed', e); }
     }
     fetchPrices();
